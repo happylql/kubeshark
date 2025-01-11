@@ -3,14 +3,14 @@ package connect
 import (
 	"bytes"
 	"encoding/json"
-	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"time"
 
 	"github.com/kubeshark/kubeshark/config"
-	"github.com/kubeshark/kubeshark/misc"
 	"github.com/kubeshark/kubeshark/utils"
 
 	"github.com/rs/zerolog/log"
@@ -88,39 +88,6 @@ func (connector *Connector) PostWorkerPodToHub(pod *v1.Pod) {
 	}
 }
 
-type postRegexRequest struct {
-	Regex      string   `json:"regex"`
-	Namespaces []string `json:"namespaces"`
-}
-
-func (connector *Connector) PostRegexToHub(regex string, namespaces []string) {
-	postRegexUrl := fmt.Sprintf("%s/pods/regex", connector.url)
-
-	payload := postRegexRequest{
-		Regex:      regex,
-		Namespaces: namespaces,
-	}
-
-	if payloadMarshalled, err := json.Marshal(payload); err != nil {
-		log.Error().Err(err).Msg("Failed to marshal the pod regex:")
-	} else {
-		ok := false
-		for !ok {
-			var resp *http.Response
-			if resp, err = utils.Post(postRegexUrl, "application/json", bytes.NewBuffer(payloadMarshalled), connector.client, config.Config.License); err != nil || resp.StatusCode != http.StatusOK {
-				if _, ok := err.(*url.Error); ok {
-					break
-				}
-				log.Warn().Err(err).Msg("Failed sending the pod regex to Hub. Retrying...")
-			} else {
-				log.Debug().Str("regex", regex).Strs("namespaces", namespaces).Msg("Reported pod regex to Hub:")
-				return
-			}
-			time.Sleep(DefaultSleep)
-		}
-	}
-}
-
 type postLicenseRequest struct {
 	License string `json:"license"`
 }
@@ -152,34 +119,10 @@ func (connector *Connector) PostLicense(license string) {
 	}
 }
 
-func (connector *Connector) PostLicenseSingle(license string) {
-	postLicenseUrl := fmt.Sprintf("%s/license", connector.url)
+func (connector *Connector) PostPcapsMerge(out *os.File) {
+	postEnvUrl := fmt.Sprintf("%s/pcaps/merge", connector.url)
 
-	payload := postLicenseRequest{
-		License: license,
-	}
-
-	if payloadMarshalled, err := json.Marshal(payload); err != nil {
-		log.Error().Err(err).Msg("Failed to marshal the payload:")
-	} else {
-		var resp *http.Response
-		if resp, err = utils.Post(postLicenseUrl, "application/json", bytes.NewBuffer(payloadMarshalled), connector.client, config.Config.License); err != nil || resp.StatusCode != http.StatusOK {
-			log.Warn().Err(err).Msg("Failed sending the license to Hub.")
-		} else {
-			log.Debug().Str("license", license).Msg("Reported license to Hub:")
-			return
-		}
-	}
-}
-
-func (connector *Connector) PostEnv(env map[string]interface{}) {
-	if len(env) == 0 {
-		return
-	}
-
-	postEnvUrl := fmt.Sprintf("%s/scripts/env", connector.url)
-
-	if envMarshalled, err := json.Marshal(env); err != nil {
+	if envMarshalled, err := json.Marshal(map[string]string{"query": ""}); err != nil {
 		log.Error().Err(err).Msg("Failed to marshal the env:")
 	} else {
 		ok := false
@@ -189,154 +132,26 @@ func (connector *Connector) PostEnv(env map[string]interface{}) {
 				if _, ok := err.(*url.Error); ok {
 					break
 				}
-				log.Warn().Err(err).Msg("Failed sending the scripting environment variables to Hub. Retrying...")
+				log.Warn().Err(err).Msg("Failed exported PCAP download. Retrying...")
 			} else {
-				log.Debug().Interface("env", env).Msg("Reported scripting environment variables to Hub:")
-				return
-			}
-			time.Sleep(DefaultSleep)
-		}
-	}
-}
+				defer resp.Body.Close()
 
-func (connector *Connector) PostScript(script *misc.Script) (index int64, err error) {
-	postScriptUrl := fmt.Sprintf("%s/scripts", connector.url)
-
-	var scriptMarshalled []byte
-	if scriptMarshalled, err = json.Marshal(script); err != nil {
-		log.Error().Err(err).Msg("Failed to marshal the script:")
-	} else {
-		ok := false
-		for !ok {
-			var resp *http.Response
-			if resp, err = utils.Post(postScriptUrl, "application/json", bytes.NewBuffer(scriptMarshalled), connector.client, config.Config.License); err != nil || resp.StatusCode != http.StatusOK {
-				if _, ok := err.(*url.Error); ok {
-					break
+				// Check server response
+				if resp.StatusCode != http.StatusOK {
+					log.Error().Str("status", resp.Status).Err(err).Msg("Failed exported PCAP download.")
+					return
 				}
-				log.Warn().Err(err).Msg("Failed creating script Hub:")
-			} else {
 
-				var j map[string]interface{}
-				err = json.NewDecoder(resp.Body).Decode(&j)
+				// Writer the body to file
+				_, err = io.Copy(out, resp.Body)
 				if err != nil {
+					log.Error().Err(err).Msg("Failed writing PCAP export:")
 					return
 				}
-
-				val, ok := j["index"]
-				if !ok {
-					err = errors.New("Response does not contain `key` field!")
-					return
-				}
-
-				index = int64(val.(float64))
-
-				log.Debug().Int("index", int(index)).Interface("script", script).Msg("Created script on Hub:")
+				log.Info().Str("path", out.Name()).Msg("Downloaded exported PCAP:")
 				return
 			}
 			time.Sleep(DefaultSleep)
 		}
-	}
-
-	return
-}
-
-func (connector *Connector) PutScript(script *misc.Script, index int64) (err error) {
-	putScriptUrl := fmt.Sprintf("%s/scripts/%d", connector.url, index)
-
-	var scriptMarshalled []byte
-	if scriptMarshalled, err = json.Marshal(script); err != nil {
-		log.Error().Err(err).Msg("Failed to marshal the script:")
-	} else {
-		ok := false
-		for !ok {
-			client := &http.Client{}
-
-			var req *http.Request
-			req, err = http.NewRequest(http.MethodPut, putScriptUrl, bytes.NewBuffer(scriptMarshalled))
-			if err != nil {
-				log.Error().Err(err).Send()
-				return
-			}
-			req.Header.Set("Content-Type", "application/json")
-			req.Header.Set("License-Key", config.Config.License)
-
-			var resp *http.Response
-			resp, err = client.Do(req)
-			if err != nil {
-				log.Error().Err(err).Send()
-				return
-			}
-
-			if resp.StatusCode != http.StatusOK {
-				if _, ok := err.(*url.Error); ok {
-					break
-				}
-				log.Warn().Err(err).Msg("Failed updating script on Hub:")
-			} else {
-				log.Debug().Int("index", int(index)).Interface("script", script).Msg("Updated script on Hub:")
-				return
-			}
-			time.Sleep(DefaultSleep)
-		}
-	}
-
-	return
-}
-
-func (connector *Connector) DeleteScript(index int64) (err error) {
-	deleteScriptUrl := fmt.Sprintf("%s/scripts/%d", connector.url, index)
-
-	ok := false
-	for !ok {
-		client := &http.Client{}
-
-		var req *http.Request
-		req, err = http.NewRequest(http.MethodDelete, deleteScriptUrl, nil)
-		if err != nil {
-			log.Error().Err(err).Send()
-			return
-		}
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("License-Key", config.Config.License)
-
-		var resp *http.Response
-		resp, err = client.Do(req)
-		if err != nil {
-			log.Error().Err(err).Send()
-			return
-		}
-
-		if resp.StatusCode != http.StatusOK {
-			if _, ok := err.(*url.Error); ok {
-				break
-			}
-			log.Warn().Err(err).Msg("Failed deleting script on Hub:")
-		} else {
-			log.Debug().Int("index", int(index)).Msg("Deleted script on Hub:")
-			return
-		}
-		time.Sleep(DefaultSleep)
-	}
-
-	return
-}
-
-func (connector *Connector) PostScriptDone() {
-	postScripDonetUrl := fmt.Sprintf("%s/scripts/done", connector.url)
-
-	ok := false
-	var err error
-	for !ok {
-		var resp *http.Response
-		if resp, err = utils.Post(postScripDonetUrl, "application/json", nil, connector.client, config.Config.License); err != nil || resp.StatusCode != http.StatusOK {
-			if _, ok := err.(*url.Error); ok {
-				break
-			}
-			log.Warn().Err(err).Msg("Failed sending the POST scripts done to Hub. Retrying...")
-		} else {
-			log.Debug().Msg("Reported POST scripts done to Hub.")
-			return
-		}
-		time.Sleep(DefaultSleep)
 	}
 }

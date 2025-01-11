@@ -1,0 +1,116 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app.kubeshark.co/app: front
+    {{- include "kubeshark.labels" . | nindent 4 }}
+  annotations:
+  {{- if .Values.tap.annotations }}
+    {{- toYaml .Values.tap.annotations | nindent 4 }}
+  {{- end }}
+  name: {{ include "kubeshark.name" . }}-front
+  namespace: {{ .Release.Namespace }}
+spec:
+  replicas: 1  # Set the desired number of replicas
+  selector:
+    matchLabels:
+      app.kubeshark.co/app: front
+      {{- include "kubeshark.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        app.kubeshark.co/app: front
+        {{- include "kubeshark.labels" . | nindent 8 }}
+    spec:
+      containers:
+        - env:
+            - name: REACT_APP_AUTH_ENABLED
+              value: '{{- if or (and .Values.cloudLicenseEnabled (not (empty .Values.license))) (not .Values.internetConnectivity) -}}
+                      "false"
+                    {{- else -}}
+                      {{ .Values.cloudLicenseEnabled | ternary "true" .Values.tap.auth.enabled }}
+                    {{- end }}'
+            - name: REACT_APP_AUTH_TYPE
+              value: '{{ not (eq .Values.tap.auth.type "") | ternary (.Values.cloudLicenseEnabled | ternary "oidc" .Values.tap.auth.type) " " }}'
+            - name: REACT_APP_AUTH_SAML_IDP_METADATA_URL
+              value: '{{ not (eq .Values.tap.auth.saml.idpMetadataUrl "") | ternary .Values.tap.auth.saml.idpMetadataUrl " " }}'
+            - name: REACT_APP_TIMEZONE
+              value: '{{ not (eq .Values.timezone "") | ternary .Values.timezone " " }}'
+            - name: REACT_APP_SCRIPTING_DISABLED
+              value: '{{ .Values.tap.scriptingDisabled }}'
+            - name: REACT_APP_TARGETED_PODS_UPDATE_DISABLED
+              value: '{{ .Values.tap.targetedPodsUpdateDisabled }}'
+            - name: REACT_APP_PRESET_FILTERS_CHANGING_ENABLED
+              value: '{{ .Values.tap.presetFiltersChangingEnabled }}'
+            - name: REACT_APP_BPF_OVERRIDE_DISABLED
+              value: '{{ eq .Values.tap.packetCapture "ebpf" | ternary "true" "false" }}'
+            - name: REACT_APP_RECORDING_DISABLED
+              value: '{{ .Values.tap.recordingDisabled }}'
+            - name: REACT_APP_STOP_TRAFFIC_CAPTURING_DISABLED
+              value: '{{- if and .Values.tap.stopTrafficCapturingDisabled .Values.tap.stopped -}}
+                        false
+                      {{- else -}}
+                        {{ .Values.tap.stopTrafficCapturingDisabled | ternary "true" "false" }}
+                      {{- end -}}'
+            - name: 'REACT_APP_CLOUD_LICENSE_ENABLED'
+              value: '{{- if or (and .Values.cloudLicenseEnabled (not (empty .Values.license))) (not .Values.internetConnectivity) -}}
+                        "false"
+                      {{- else -}}
+                        {{ .Values.cloudLicenseEnabled }}
+                      {{- end }}'
+            - name: REACT_APP_SUPPORT_CHAT_ENABLED
+              value: '{{ and .Values.supportChatEnabled .Values.internetConnectivity | ternary "true" "false" }}'
+            - name: REACT_APP_DISSECTORS_UPDATING_ENABLED
+              value: '{{ .Values.dissectorsUpdatingEnabled | ternary "true" "false" }}'
+            - name: REACT_APP_SENTRY_ENABLED
+              value: '{{ (include "sentry.enabled" .) }}'
+            - name: REACT_APP_SENTRY_ENVIRONMENT
+              value: '{{ .Values.tap.sentry.environment }}'
+        {{- if .Values.tap.docker.overrideImage.front }}
+          image: '{{ .Values.tap.docker.overrideImage.front }}'
+        {{- else if .Values.tap.docker.overrideTag.front }}
+          image: '{{ .Values.tap.docker.registry }}/front:{{ .Values.tap.docker.overrideTag.front }}'
+        {{ else }}
+          image: '{{ .Values.tap.docker.registry }}/front:{{ not (eq .Values.tap.docker.tag "") | ternary .Values.tap.docker.tag (include "kubeshark.defaultVersion" .) }}'
+        {{- end }}
+          imagePullPolicy: {{ .Values.tap.docker.imagePullPolicy }}
+        {{- if .Values.tap.docker.imagePullSecrets }}
+          imagePullSecrets:
+            {{- range .Values.tap.docker.imagePullSecrets }}
+            - name: {{ . }}
+            {{- end }}
+        {{- end }}
+          name: kubeshark-front
+          livenessProbe:
+            periodSeconds: 1
+            failureThreshold: 3
+            successThreshold: 1
+            initialDelaySeconds: 3
+            tcpSocket:
+              port: 8080
+          readinessProbe:
+            periodSeconds: 1
+            failureThreshold: 3
+            successThreshold: 1
+            initialDelaySeconds: 3
+            tcpSocket:
+              port: 8080
+            timeoutSeconds: 1
+          resources:
+            limits:
+              cpu: 750m
+              memory: 1Gi
+            requests:
+              cpu: 50m
+              memory: 50Mi
+          volumeMounts:
+            - name: nginx-config
+              mountPath: /etc/nginx/conf.d/default.conf
+              subPath: default.conf
+              readOnly: true
+      volumes:
+        - name: nginx-config
+          configMap:
+            name: kubeshark-nginx-config-map
+      dnsPolicy: ClusterFirstWithHostNet
+      serviceAccountName: {{ include "kubeshark.serviceAccountName" . }}

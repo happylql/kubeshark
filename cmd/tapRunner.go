@@ -2,13 +2,14 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"os"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/kubeshark/kubeshark/docker"
-	"github.com/kubeshark/kubeshark/internal/connect"
 	"github.com/kubeshark/kubeshark/kubernetes/helm"
 	"github.com/kubeshark/kubeshark/misc"
 	"github.com/kubeshark/kubeshark/utils"
@@ -30,7 +31,6 @@ type tapState struct {
 }
 
 var state tapState
-var connector *connect.Connector
 
 type Readiness struct {
 	Hub   bool
@@ -44,22 +44,15 @@ var ready *Readiness
 func tap() {
 	ready = &Readiness{}
 	state.startTime = time.Now()
-	docker.SetRegistry(config.Config.Tap.Docker.Registry)
-	docker.SetTag(config.Config.Tap.Docker.Tag)
-	log.Info().Str("registry", docker.GetRegistry()).Str("tag", docker.GetTag()).Msg("Using Docker:")
-	if config.Config.Tap.Pcap != "" {
-		pcap(config.Config.Tap.Pcap)
-		return
-	}
+	log.Info().Str("registry", config.Config.Tap.Docker.Registry).Str("tag", config.Config.Tap.Docker.Tag).Msg("Using Docker:")
 
 	log.Info().
 		Str("limit", config.Config.Tap.StorageLimit).
 		Msg(fmt.Sprintf("%s will store the traffic up to a limit (per node). Oldest TCP/UDP streams will be removed once the limit is reached.", misc.Software))
 
-	connector = connect.NewConnector(kubernetes.GetProxyOnPort(config.Config.Tap.Proxy.Hub.Port), connect.DefaultRetries, connect.DefaultTimeout)
-
 	kubernetesProvider, err := getKubernetesProviderForCli(false, false)
 	if err != nil {
+		log.Error().Err(err).Send()
 		return
 	}
 
@@ -68,12 +61,10 @@ func tap() {
 
 	state.targetNamespaces = kubernetesProvider.GetNamespaces()
 
-	if config.Config.IsNsRestrictedMode() {
-		if len(state.targetNamespaces) != 1 || !utils.Contains(state.targetNamespaces, config.Config.Tap.SelfNamespace) {
-			log.Error().Msg(fmt.Sprintf("%s can't resolve IPs in other namespaces when running in namespace restricted mode. You can use the same namespace for --%s and --%s", misc.Software, configStructs.NamespacesLabel, configStructs.SelfNamespaceLabel))
-			return
-		}
-	}
+	log.Info().
+		Bool("enabled", config.Config.Tap.Telemetry.Enabled).
+		Str("notice", "Telemetry can be disabled by setting the flag: --telemetry-enabled=false").
+		Msg("Telemetry")
 
 	log.Info().Strs("namespaces", state.targetNamespaces).Msg("Targeting pods in:")
 
@@ -87,19 +78,29 @@ func tap() {
 
 	log.Info().Msg(fmt.Sprintf("Waiting for the creation of %s resources...", misc.Software))
 
-	rel, err := helm.NewHelmDefault().Install()
+	rel, err := helm.NewHelm(
+		config.Config.Tap.Release.Repo,
+		config.Config.Tap.Release.Name,
+		config.Config.Tap.Release.Namespace,
+	).Install()
 	if err != nil {
-		log.Error().Err(err).Send()
-		return
+		if err.Error() != "cannot re-use a name that is still in use" {
+			log.Error().Err(err).Send()
+			os.Exit(1)
+		}
+		log.Info().Msg("Found an existing installation, skipping Helm install...")
+
+		updateConfig(kubernetesProvider)
+		postFrontStarted(ctx, kubernetesProvider, cancel)
 	} else {
 		log.Info().Msgf("Installed the Helm release: %s", rel.Name)
+
+		go watchHubEvents(ctx, kubernetesProvider, cancel)
+		go watchHubPod(ctx, kubernetesProvider, cancel)
+		go watchFrontPod(ctx, kubernetesProvider, cancel)
 	}
 
 	defer finishTapExecution(kubernetesProvider)
-
-	go watchHubEvents(ctx, kubernetesProvider, cancel)
-	go watchHubPod(ctx, kubernetesProvider, cancel)
-	go watchFrontPod(ctx, kubernetesProvider, cancel)
 
 	// block until exit signal or error
 	utils.WaitForTermination(ctx, cancel)
@@ -116,7 +117,7 @@ func printProxyCommandSuggestion() {
 }
 
 func finishTapExecution(kubernetesProvider *kubernetes.Provider) {
-	finishSelfExecution(kubernetesProvider, config.Config.IsNsRestrictedMode(), config.Config.Tap.SelfNamespace)
+	finishSelfExecution(kubernetesProvider)
 }
 
 /*
@@ -147,9 +148,9 @@ func printNoPodsFoundSuggestion(targetNamespaces []string) {
 }
 
 func watchHubPod(ctx context.Context, kubernetesProvider *kubernetes.Provider, cancel context.CancelFunc) {
-	podExactRegex := regexp.MustCompile(fmt.Sprintf("^%s$", kubernetes.HubPodName))
+	podExactRegex := regexp.MustCompile(fmt.Sprintf("^%s", kubernetes.HubPodName))
 	podWatchHelper := kubernetes.NewPodWatchHelper(kubernetesProvider, podExactRegex)
-	eventChan, errorChan := kubernetes.FilteredWatch(ctx, podWatchHelper, []string{config.Config.Tap.SelfNamespace}, podWatchHelper)
+	eventChan, errorChan := kubernetes.FilteredWatch(ctx, podWatchHelper, []string{config.Config.Tap.Release.Namespace}, podWatchHelper)
 	isPodReady := false
 
 	timeAfter := time.After(120 * time.Second)
@@ -188,7 +189,7 @@ func watchHubPod(ctx context.Context, kubernetesProvider *kubernetes.Provider, c
 					ready.Lock()
 					ready.Hub = true
 					ready.Unlock()
-					postHubStarted(ctx, kubernetesProvider, cancel, false)
+					log.Info().Str("pod", kubernetes.HubPodName).Msg("Ready.")
 				}
 
 				ready.Lock()
@@ -216,7 +217,7 @@ func watchHubPod(ctx context.Context, kubernetesProvider *kubernetes.Provider, c
 
 			log.Error().
 				Str("pod", kubernetes.HubPodName).
-				Str("namespace", config.Config.Tap.SelfNamespace).
+				Str("namespace", config.Config.Tap.Release.Namespace).
 				Err(err).
 				Msg("Failed creating pod.")
 			cancel()
@@ -238,9 +239,9 @@ func watchHubPod(ctx context.Context, kubernetesProvider *kubernetes.Provider, c
 }
 
 func watchFrontPod(ctx context.Context, kubernetesProvider *kubernetes.Provider, cancel context.CancelFunc) {
-	podExactRegex := regexp.MustCompile(fmt.Sprintf("^%s$", kubernetes.FrontPodName))
+	podExactRegex := regexp.MustCompile(fmt.Sprintf("^%s", kubernetes.FrontPodName))
 	podWatchHelper := kubernetes.NewPodWatchHelper(kubernetesProvider, podExactRegex)
-	eventChan, errorChan := kubernetes.FilteredWatch(ctx, podWatchHelper, []string{config.Config.Tap.SelfNamespace}, podWatchHelper)
+	eventChan, errorChan := kubernetes.FilteredWatch(ctx, podWatchHelper, []string{config.Config.Tap.Release.Namespace}, podWatchHelper)
 	isPodReady := false
 
 	timeAfter := time.After(120 * time.Second)
@@ -278,6 +279,7 @@ func watchFrontPod(ctx context.Context, kubernetesProvider *kubernetes.Provider,
 					ready.Lock()
 					ready.Front = true
 					ready.Unlock()
+					log.Info().Str("pod", kubernetes.FrontPodName).Msg("Ready.")
 				}
 
 				ready.Lock()
@@ -305,7 +307,7 @@ func watchFrontPod(ctx context.Context, kubernetesProvider *kubernetes.Provider,
 
 			log.Error().
 				Str("pod", kubernetes.FrontPodName).
-				Str("namespace", config.Config.Tap.SelfNamespace).
+				Str("namespace", config.Config.Tap.Release.Namespace).
 				Err(err).
 				Msg("Failed creating pod.")
 
@@ -328,7 +330,7 @@ func watchFrontPod(ctx context.Context, kubernetesProvider *kubernetes.Provider,
 func watchHubEvents(ctx context.Context, kubernetesProvider *kubernetes.Provider, cancel context.CancelFunc) {
 	podExactRegex := regexp.MustCompile(fmt.Sprintf("^%s", kubernetes.HubPodName))
 	eventWatchHelper := kubernetes.NewEventWatchHelper(kubernetesProvider, podExactRegex, "pod")
-	eventChan, errorChan := kubernetes.FilteredWatch(ctx, eventWatchHelper, []string{config.Config.Tap.SelfNamespace}, eventWatchHelper)
+	eventChan, errorChan := kubernetes.FilteredWatch(ctx, eventWatchHelper, []string{config.Config.Tap.Release.Namespace}, eventWatchHelper)
 	for {
 		select {
 		case wEvent, ok := <-eventChan:
@@ -394,56 +396,6 @@ func watchHubEvents(ctx context.Context, kubernetesProvider *kubernetes.Provider
 	}
 }
 
-func postHubStarted(ctx context.Context, kubernetesProvider *kubernetes.Provider, cancel context.CancelFunc, update bool) {
-	startProxyReportErrorIfAny(
-		kubernetesProvider,
-		ctx,
-		kubernetes.HubServiceName,
-		kubernetes.HubPodName,
-		configStructs.ProxyHubPortLabel,
-		config.Config.Tap.Proxy.Hub.Port,
-		configStructs.ContainerPort,
-		"/echo",
-	)
-
-	if update {
-		// Pod regex
-		connector.PostRegexToHub(config.Config.Tap.PodRegexStr, state.targetNamespaces)
-
-		// License
-		if config.Config.License != "" {
-			connector.PostLicense(config.Config.License)
-		}
-
-		// Scripting
-		connector.PostEnv(config.Config.Scripting.Env)
-
-		scripts, err := config.Config.Scripting.GetScripts()
-		if err != nil {
-			log.Error().Err(err).Send()
-		}
-
-		for _, script := range scripts {
-			_, err = connector.PostScript(script)
-			if err != nil {
-				log.Error().Err(err).Send()
-			}
-		}
-
-		connector.PostScriptDone()
-	}
-
-	if !update && !config.Config.Tap.Ingress.Enabled {
-		// Hub proxy URL
-		url := kubernetes.GetProxyOnPort(config.Config.Tap.Proxy.Hub.Port)
-		log.Info().Str("url", url).Msg(fmt.Sprintf(utils.Green, "Hub is available at:"))
-	}
-
-	if config.Config.Scripting.Source != "" && config.Config.Scripting.WatchScripts {
-		watchScripts(false)
-	}
-}
-
 func postFrontStarted(ctx context.Context, kubernetesProvider *kubernetes.Provider, cancel context.CancelFunc) {
 	startProxyReportErrorIfAny(
 		kubernetesProvider,
@@ -467,4 +419,51 @@ func postFrontStarted(ctx context.Context, kubernetesProvider *kubernetes.Provid
 	if !config.Config.HeadlessMode {
 		utils.OpenBrowser(url)
 	}
+
+	for !ready.Hub {
+		time.Sleep(100 * time.Millisecond)
+	}
+
+
+	if (config.Config.Scripting.Source != "" || len(config.Config.Scripting.Sources) > 0) && config.Config.Scripting.WatchScripts {
+		watchScripts(ctx, kubernetesProvider, false)
+	}
+
+	if config.Config.Scripting.Console {
+		go runConsoleWithoutProxy()
+	}
+}
+
+func updateConfig(kubernetesProvider *kubernetes.Provider) {
+	_, _ = kubernetes.SetSecret(kubernetesProvider, kubernetes.SECRET_LICENSE, config.Config.License)
+	_, _ = kubernetes.SetConfig(kubernetesProvider, kubernetes.CONFIG_POD_REGEX, config.Config.Tap.PodRegexStr)
+	_, _ = kubernetes.SetConfig(kubernetesProvider, kubernetes.CONFIG_NAMESPACES, strings.Join(config.Config.Tap.Namespaces, ","))
+	_, _ = kubernetes.SetConfig(kubernetesProvider, kubernetes.CONFIG_EXCLUDED_NAMESPACES, strings.Join(config.Config.Tap.ExcludedNamespaces, ","))
+
+	data, err := json.Marshal(config.Config.Scripting.Env)
+	if err != nil {
+		log.Error().Str("config", kubernetes.CONFIG_SCRIPTING_ENV).Err(err).Send()
+		return
+	} else {
+		_, _ = kubernetes.SetConfig(kubernetesProvider, kubernetes.CONFIG_SCRIPTING_ENV, string(data))
+	}
+
+	ingressEnabled := ""
+	if config.Config.Tap.Ingress.Enabled {
+		ingressEnabled = "true"
+	}
+
+	authEnabled := ""
+	if config.Config.Tap.Auth.Enabled {
+		authEnabled = "true"
+	}
+
+	_, _ = kubernetes.SetConfig(kubernetesProvider, kubernetes.CONFIG_INGRESS_ENABLED, ingressEnabled)
+	_, _ = kubernetes.SetConfig(kubernetesProvider, kubernetes.CONFIG_INGRESS_HOST, config.Config.Tap.Ingress.Host)
+
+	_, _ = kubernetes.SetConfig(kubernetesProvider, kubernetes.CONFIG_PROXY_FRONT_PORT, fmt.Sprint(config.Config.Tap.Proxy.Front.Port))
+
+	_, _ = kubernetes.SetConfig(kubernetesProvider, kubernetes.CONFIG_AUTH_ENABLED, authEnabled)
+	_, _ = kubernetes.SetConfig(kubernetesProvider, kubernetes.CONFIG_AUTH_TYPE, config.Config.Tap.Auth.Type)
+	_, _ = kubernetes.SetConfig(kubernetesProvider, kubernetes.CONFIG_AUTH_SAML_IDP_METADATA_URL, config.Config.Tap.Auth.Saml.IdpMetadataUrl)
 }

@@ -5,21 +5,97 @@ import (
 	"path/filepath"
 
 	"github.com/kubeshark/kubeshark/config/configStructs"
-	"github.com/kubeshark/kubeshark/misc"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/client-go/util/homedir"
 )
 
 const (
-	KubeConfigPathConfigName = "kube-configpath"
+	KubeConfigPathConfigName = "kube-configPath"
 )
 
 func CreateDefaultConfig() ConfigStruct {
-	return ConfigStruct{}
+	return ConfigStruct{
+		Tap: configStructs.TapConfig{
+			NodeSelectorTerms: []v1.NodeSelectorTerm{
+				{
+					MatchExpressions: []v1.NodeSelectorRequirement{
+						{
+							Key:      "kubernetes.io/os",
+							Operator: v1.NodeSelectorOpIn,
+							Values:   []string{"linux"},
+						},
+					},
+				},
+			},
+			Capabilities: configStructs.CapabilitiesConfig{
+				NetworkCapture: []string{
+					// NET_RAW is required to listen the network traffic
+					"NET_RAW",
+					// NET_ADMIN is required to listen the network traffic
+					"NET_ADMIN",
+				},
+				ServiceMeshCapture: []string{
+					// SYS_ADMIN is required to read /proc/PID/net/ns + to install eBPF programs (kernel < 5.8)
+					"SYS_ADMIN",
+					// SYS_PTRACE is required to set netns to other process + to open libssl.so of other process
+					"SYS_PTRACE",
+					// DAC_OVERRIDE is required to read /proc/PID/environ
+					"DAC_OVERRIDE",
+				},
+				EBPFCapture: []string{
+					// SYS_ADMIN is required to read /proc/PID/net/ns + to install eBPF programs (kernel < 5.8)
+					"SYS_ADMIN",
+					// SYS_PTRACE is required to set netns to other process + to open libssl.so of other process
+					"SYS_PTRACE",
+					// SYS_RESOURCE is required to change rlimits for eBPF
+					"SYS_RESOURCE",
+					// IPC_LOCK is required for ebpf perf buffers allocations after some amount of size buffer size:
+					// https://github.com/kubeshark/tracer/blob/13e24725ba8b98216dd0e553262e6d9c56dce5fa/main.go#L82)
+					"IPC_LOCK",
+				},
+			},
+			Auth: configStructs.AuthConfig{
+				Saml: configStructs.SamlConfig{
+					RoleAttribute: "role",
+					Roles: map[string]configStructs.Role{
+						"admin": {
+							Filter:          "",
+							CanDownloadPCAP: true,
+							CanUseScripting: true,
+							ScriptingPermissions: configStructs.ScriptingPermissions{
+								CanSave:     true,
+								CanActivate: true,
+								CanDelete:   true,
+							},
+							CanUpdateTargetedPods:   true,
+							CanStopTrafficCapturing: true,
+							ShowAdminConsoleLink:    true,
+						},
+					},
+				},
+			},
+			EnabledDissectors: []string{
+				"amqp",
+				"dns",
+				"http",
+				"icmp",
+				"kafka",
+				"redis",
+				"sctp",
+				"syscall",
+				// "tcp",
+				// "udp",
+				"ws",
+				// "tlsx",
+				"ldap",
+				"radius",
+			},
+		},
+	}
 }
 
 type KubeConfig struct {
-	ConfigPathStr string `yaml:"configpath" json:"configpath"`
+	ConfigPathStr string `yaml:"configPath" json:"configPath"`
 	Context       string `yaml:"context" json:"context"`
 }
 
@@ -28,15 +104,22 @@ type ManifestsConfig struct {
 }
 
 type ConfigStruct struct {
-	Tap          configStructs.TapConfig       `yaml:"tap" json:"tap"`
-	Logs         configStructs.LogsConfig      `yaml:"logs" json:"logs"`
-	Config       configStructs.ConfigConfig    `yaml:"config,omitempty" json:"config,omitempty"`
-	Kube         KubeConfig                    `yaml:"kube" json:"kube"`
-	DumpLogs     bool                          `yaml:"dumplogs" json:"dumplogs" default:"false"`
-	HeadlessMode bool                          `yaml:"headless" json:"headless" default:"false"`
-	License      string                        `yaml:"license" json:"license" default:""`
-	Scripting    configStructs.ScriptingConfig `yaml:"scripting" json:"scripting"`
-	Manifests    ManifestsConfig               `yaml:"manifests,omitempty" json:"manifests,omitempty"`
+	Tap                       configStructs.TapConfig       `yaml:"tap" json:"tap"`
+	Logs                      configStructs.LogsConfig      `yaml:"logs" json:"logs"`
+	Config                    configStructs.ConfigConfig    `yaml:"config,omitempty" json:"config,omitempty"`
+	PcapDump                  configStructs.PcapDumpConfig  `yaml:"pcapdump" json:"pcapdump"`
+	Kube                      KubeConfig                    `yaml:"kube" json:"kube"`
+	DumpLogs                  bool                          `yaml:"dumpLogs" json:"dumpLogs" default:"false"`
+	HeadlessMode              bool                          `yaml:"headless" json:"headless" default:"false"`
+	License                   string                        `yaml:"license" json:"license" default:""`
+	CloudLicenseEnabled       bool                          `yaml:"cloudLicenseEnabled" json:"cloudLicenseEnabled" default:"true"`
+	SupportChatEnabled        bool                          `yaml:"supportChatEnabled" json:"supportChatEnabled" default:"true"`
+	InternetConnectivity      bool                          `yaml:"internetConnectivity" json:"internetConnectivity" default:"true"`
+	DissectorsUpdatingEnabled bool                          `yaml:"dissectorsUpdatingEnabled" json:"dissectorsUpdatingEnabled" default:"true"`
+	Scripting                 configStructs.ScriptingConfig `yaml:"scripting" json:"scripting"`
+	Manifests                 ManifestsConfig               `yaml:"manifests,omitempty" json:"manifests,omitempty"`
+	Timezone                  string                        `yaml:"timezone" json:"timezone"`
+	LogLevel                  string                        `yaml:"logLevel" json:"logLevel" default:"warning"`
 }
 
 func (config *ConfigStruct) ImagePullPolicy() v1.PullPolicy {
@@ -50,10 +133,6 @@ func (config *ConfigStruct) ImagePullSecrets() []v1.LocalObjectReference {
 	}
 
 	return ref
-}
-
-func (config *ConfigStruct) IsNsRestrictedMode() bool {
-	return config.Tap.SelfNamespace != misc.Program // Notice "kubeshark" string must match the default SelfNamespace
 }
 
 func (config *ConfigStruct) KubeConfigPath() string {

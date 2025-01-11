@@ -24,6 +24,7 @@ const selfServicePort = 80
 
 func StartProxy(kubernetesProvider *Provider, proxyHost string, srcPort uint16, selfNamespace string, selfServiceName string) (*http.Server, error) {
 	log.Info().
+		Str("proxy-host", proxyHost).
 		Str("namespace", selfNamespace).
 		Str("service", selfServiceName).
 		Int("src-port", int(srcPort)).
@@ -71,6 +72,10 @@ func GetProxyOnPort(port uint16) string {
 	return fmt.Sprintf("http://%s:%d", config.Config.Tap.Proxy.Host, port)
 }
 
+func GetHubUrl() string {
+	return fmt.Sprintf("%s/api", GetProxyOnPort(config.Config.Tap.Proxy.Front.Port))
+}
+
 func getRerouteHttpHandlerSelfAPI(proxyHandler http.Handler, selfNamespace string, selfServiceName string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -101,7 +106,7 @@ func getRerouteHttpHandlerSelfStatic(proxyHandler http.Handler, selfNamespace st
 }
 
 func NewPortForward(kubernetesProvider *Provider, namespace string, podRegex *regexp.Regexp, srcPort uint16, dstPort uint16, ctx context.Context) (*portforward.PortForwarder, error) {
-	pods, err := kubernetesProvider.ListAllRunningPodsMatchingRegex(ctx, podRegex, []string{namespace})
+	pods, err := kubernetesProvider.ListPodsByAppLabel(ctx, namespace, map[string]string{AppLabelKey: "front"})
 	if err != nil {
 		return nil, err
 	} else if len(pods) == 0 {
@@ -133,6 +138,7 @@ func NewPortForward(kubernetesProvider *Provider, namespace string, podRegex *re
 	go func() {
 		if err = forwarder.ForwardPorts(); err != nil {
 			log.Error().Err(err).Msg("While Kubernetes port-forwarding!")
+			log.Info().Str("command", fmt.Sprintf("kubectl port-forward -n %s service/kubeshark-front 8899:80", config.Config.Tap.Release.Namespace)).Msg("Please try running:")
 			return
 		}
 	}()
