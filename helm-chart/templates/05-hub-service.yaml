@@ -2,19 +2,20 @@
 apiVersion: v1
 kind: Service
 metadata:
-  creationTimestamp: null
   labels:
-    kubeshark-created-by: kubeshark
-    kubeshark-managed-by: kubeshark
+    app.kubeshark.co/app: hub
+    {{- include "kubeshark.labels" . | nindent 4 }}
+  annotations:
+  {{- if .Values.tap.annotations }}
+    {{- toYaml .Values.tap.annotations | nindent 4 }}
+  {{- end }}
   name: kubeshark-hub
-  namespace: '{{ .Values.tap.selfnamespace }}'
+  namespace: {{ .Release.Namespace }}
 spec:
   ports:
     - name: kubeshark-hub
       port: 80
-      targetPort: 80
+      targetPort: 8080
   selector:
-    app: kubeshark-hub
-  type: NodePort
-status:
-  loadBalancer: {}
+    app.kubeshark.co/app: hub
+  type: ClusterIP

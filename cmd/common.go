@@ -18,11 +18,11 @@ import (
 )
 
 func startProxyReportErrorIfAny(kubernetesProvider *kubernetes.Provider, ctx context.Context, serviceName string, podName string, proxyPortLabel string, srcPort uint16, dstPort uint16, healthCheck string) {
-	httpServer, err := kubernetes.StartProxy(kubernetesProvider, config.Config.Tap.Proxy.Host, srcPort, config.Config.Tap.SelfNamespace, serviceName)
+	httpServer, err := kubernetes.StartProxy(kubernetesProvider, config.Config.Tap.Proxy.Host, srcPort, config.Config.Tap.Release.Namespace, serviceName)
 	if err != nil {
 		log.Error().
 			Err(errormessage.FormatError(err)).
-			Msg(fmt.Sprintf("Error occured while running K8s proxy. Try setting different port using --%s", proxyPortLabel))
+			Msg(fmt.Sprintf("Error occurred while running K8s proxy. Try setting different port using --%s", proxyPortLabel))
 		return
 	}
 
@@ -38,11 +38,11 @@ func startProxyReportErrorIfAny(kubernetesProvider *kubernetes.Provider, ctx con
 		}
 
 		podRegex, _ := regexp.Compile(podName)
-		if _, err := kubernetes.NewPortForward(kubernetesProvider, config.Config.Tap.SelfNamespace, podRegex, srcPort, dstPort, ctx); err != nil {
+		if _, err := kubernetes.NewPortForward(kubernetesProvider, config.Config.Tap.Release.Namespace, podRegex, srcPort, dstPort, ctx); err != nil {
 			log.Error().
 				Str("pod-regex", podRegex.String()).
 				Err(errormessage.FormatError(err)).
-				Msg(fmt.Sprintf("Error occured while running port forward. Try setting different port using --%s", proxyPortLabel))
+				Msg(fmt.Sprintf("Error occurred while running port forward. Try setting different port using --%s", proxyPortLabel))
 			return
 		}
 
@@ -99,7 +99,7 @@ func handleKubernetesProviderError(err error) {
 	}
 }
 
-func finishSelfExecution(kubernetesProvider *kubernetes.Provider, isNsRestrictedMode bool, selfNamespace string) {
+func finishSelfExecution(kubernetesProvider *kubernetes.Provider) {
 	removalCtx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
 	defer cancel()
 	dumpLogsIfNeeded(removalCtx, kubernetesProvider)
@@ -111,7 +111,7 @@ func dumpLogsIfNeeded(ctx context.Context, kubernetesProvider *kubernetes.Provid
 	}
 	dotDir := misc.GetDotFolderPath()
 	filePath := path.Join(dotDir, fmt.Sprintf("%s_logs_%s.zip", misc.Program, time.Now().Format("2006_01_02__15_04_05")))
-	if err := fsUtils.DumpLogs(ctx, kubernetesProvider, filePath); err != nil {
+	if err := fsUtils.DumpLogs(ctx, kubernetesProvider, filePath, config.Config.Logs.Grep); err != nil {
 		log.Error().Err(err).Msg("Failed to dump logs.")
 	}
 }

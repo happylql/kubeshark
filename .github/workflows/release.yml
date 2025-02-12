@@ -1,7 +1,8 @@
 on:
   push:
+    # Sequence of patterns matched against refs/tags
     tags:
-      - '*'
+    - 'v*' # Push events to matching v*, i.e. v1.0, v20.15.10
 
 name: Release
 
@@ -13,6 +14,8 @@ jobs:
   release:
     name: Build and publish a new release
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.tag }}
     steps:
       - name: Check out the repo
         uses: actions/checkout@v3
@@ -46,44 +49,19 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           artifacts: "bin/*"
           tag: ${{ steps.version.outputs.tag }}
-          prerelease: true
+          prerelease: false
           bodyFile: 'bin/README.md'
 
-  brew-tap:
-    name: Create Homebrew formulae
-    runs-on: ubuntu-latest
+  brew:
+    name: Publish a new Homebrew formulae
     needs: [release]
+    runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v3
+      - name: Bump core homebrew formula
+        uses: mislav/bump-homebrew-formula-action@v3
         with:
-          fetch-depth: 0
-
-      - name: Version
-        id: version
-        shell: bash
-        run: |
-          {
-            echo "tag=${GITHUB_REF#refs/*/}"
-            echo "build_timestamp=$(date +%s)"
-            echo "branch=${GITHUB_REF#refs/heads/}"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Fetch all tags
-        run: git fetch --force --tags
-
-      - name: Set up Go
-        uses: actions/setup-go@v4
-        with:
-          go-version-file: 'go.mod'
-
-      - name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@v4
-        with:
-          distribution: goreleaser
-          version: ${{ env.GITHUB_REF_NAME }}
-          args: release --clean
+          # A PR will be sent to github.com/Homebrew/homebrew-core to update this formula:
+          formula-name: kubeshark
+          push-to: kubeshark/homebrew-core
         env:
-          GITHUB_TOKEN: ${{ secrets.HOMEBREW_TOKEN }}
-          VER: ${{ steps.version.outputs.tag }}
-          BUILD_TIMESTAMP: ${{ steps.version.outputs.build_timestamp }}
+          COMMITTER_TOKEN: ${{ secrets.COMMITTER_TOKEN }}

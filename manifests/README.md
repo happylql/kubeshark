@@ -23,13 +23,12 @@ kubectl delete clusterrolebinding kubeshark-cluster-role-binding
 kubectl delete clusterrole kubeshark-cluster-role
 ```
 
-## Accesing
+## Accessing
 
 Do the port forwarding:
 
 ```shell
-kubectl port-forward -n kubeshark service/kubeshark-hub 8898:80 & \
-kubectl port-forward -n kubeshark service/kubeshark-front 8899:80
+kubectl port-forward service/kubeshark-front 8899:80
 ```
 
 Visit [localhost:8899](http://localhost:8899)

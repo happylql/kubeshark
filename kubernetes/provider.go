@@ -1,6 +1,7 @@
 package kubernetes
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"fmt"
@@ -8,13 +9,14 @@ import (
 	"net/url"
 	"path/filepath"
 	"regexp"
+	"strings"
 
 	"github.com/kubeshark/kubeshark/config"
 	"github.com/kubeshark/kubeshark/misc"
 	"github.com/kubeshark/kubeshark/semver"
 	"github.com/kubeshark/kubeshark/utils"
 	"github.com/rs/zerolog/log"
-	auth "k8s.io/api/authorization/v1"
+	"github.com/tanqiangyes/grep-go/reader"
 	core "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -71,59 +73,9 @@ func NewProvider(kubeConfigPath string, contextName string) (*Provider, error) {
 	}, nil
 }
 
-func (provider *Provider) CanI(ctx context.Context, namespace string, resource string, verb string, group string) (bool, error) {
-	selfSubjectAccessReview := &auth.SelfSubjectAccessReview{
-		Spec: auth.SelfSubjectAccessReviewSpec{
-			ResourceAttributes: &auth.ResourceAttributes{
-				Namespace: namespace,
-				Resource:  resource,
-				Verb:      verb,
-				Group:     group,
-			},
-		},
-	}
-
-	response, err := provider.clientSet.AuthorizationV1().SelfSubjectAccessReviews().Create(ctx, selfSubjectAccessReview, metav1.CreateOptions{})
-	if err != nil {
-		return false, err
-	}
-
-	return response.Status.Allowed, nil
-}
-
-func (provider *Provider) DoesNamespaceExist(ctx context.Context, name string) (bool, error) {
-	namespaceResource, err := provider.clientSet.CoreV1().Namespaces().Get(ctx, name, metav1.GetOptions{})
-	return provider.doesResourceExist(namespaceResource, err)
-}
-
-func (provider *Provider) DoesServiceAccountExist(ctx context.Context, namespace string, name string) (bool, error) {
-	serviceAccountResource, err := provider.clientSet.CoreV1().ServiceAccounts(namespace).Get(ctx, name, metav1.GetOptions{})
-	return provider.doesResourceExist(serviceAccountResource, err)
-}
-
 func (provider *Provider) DoesServiceExist(ctx context.Context, namespace string, name string) (bool, error) {
 	serviceResource, err := provider.clientSet.CoreV1().Services(namespace).Get(ctx, name, metav1.GetOptions{})
 	return provider.doesResourceExist(serviceResource, err)
-}
-
-func (provider *Provider) DoesClusterRoleExist(ctx context.Context, name string) (bool, error) {
-	clusterRoleResource, err := provider.clientSet.RbacV1().ClusterRoles().Get(ctx, name, metav1.GetOptions{})
-	return provider.doesResourceExist(clusterRoleResource, err)
-}
-
-func (provider *Provider) DoesClusterRoleBindingExist(ctx context.Context, name string) (bool, error) {
-	clusterRoleBindingResource, err := provider.clientSet.RbacV1().ClusterRoleBindings().Get(ctx, name, metav1.GetOptions{})
-	return provider.doesResourceExist(clusterRoleBindingResource, err)
-}
-
-func (provider *Provider) DoesRoleExist(ctx context.Context, namespace string, name string) (bool, error) {
-	roleResource, err := provider.clientSet.RbacV1().Roles(namespace).Get(ctx, name, metav1.GetOptions{})
-	return provider.doesResourceExist(roleResource, err)
-}
-
-func (provider *Provider) DoesRoleBindingExist(ctx context.Context, namespace string, name string) (bool, error) {
-	roleBindingResource, err := provider.clientSet.RbacV1().RoleBindings(namespace).Get(ctx, name, metav1.GetOptions{})
-	return provider.doesResourceExist(roleBindingResource, err)
 }
 
 func (provider *Provider) doesResourceExist(resource interface{}, err error) (bool, error) {
@@ -178,8 +130,14 @@ func (provider *Provider) ListAllRunningPodsMatchingRegex(ctx context.Context, r
 	return matchingPods, nil
 }
 
-func (provider *Provider) ListPodsByAppLabel(ctx context.Context, namespaces string, labelName string) ([]core.Pod, error) {
-	pods, err := provider.clientSet.CoreV1().Pods(namespaces).List(ctx, metav1.ListOptions{LabelSelector: fmt.Sprintf("app=%s", labelName)})
+func (provider *Provider) ListPodsByAppLabel(ctx context.Context, namespaces string, labels map[string]string) ([]core.Pod, error) {
+	pods, err := provider.clientSet.CoreV1().Pods(namespaces).List(ctx, metav1.ListOptions{
+		LabelSelector: metav1.FormatLabelSelector(
+			&metav1.LabelSelector{
+				MatchLabels: labels,
+			},
+		),
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -187,16 +145,7 @@ func (provider *Provider) ListPodsByAppLabel(ctx context.Context, namespaces str
 	return pods.Items, err
 }
 
-func (provider *Provider) ListAllNamespaces(ctx context.Context) ([]core.Namespace, error) {
-	namespaces, err := provider.clientSet.CoreV1().Namespaces().List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return nil, err
-	}
-
-	return namespaces.Items, err
-}
-
-func (provider *Provider) GetPodLogs(ctx context.Context, namespace string, podName string, containerName string) (string, error) {
+func (provider *Provider) GetPodLogs(ctx context.Context, namespace string, podName string, containerName string, grep string) (string, error) {
 	podLogOpts := core.PodLogOptions{Container: containerName}
 	req := provider.clientSet.CoreV1().Pods(namespace).GetLogs(podName, &podLogOpts)
 	podLogs, err := req.Stream(ctx)
@@ -208,8 +157,26 @@ func (provider *Provider) GetPodLogs(ctx context.Context, namespace string, podN
 	if _, err = io.Copy(buf, podLogs); err != nil {
 		return "", fmt.Errorf("error copy information from podLogs to buf, ns: %s, pod: %s, %w", namespace, podName, err)
 	}
-	str := buf.String()
-	return str, nil
+
+	if grep != "" {
+		finder, err := reader.NewFinder(grep, true, true)
+		if err != nil {
+			panic(err)
+		}
+
+		read, err := reader.NewStdReader(bufio.NewReader(buf), []reader.Finder{finder})
+		if err != nil {
+			panic(err)
+		}
+		read.Run()
+		result := read.Result()[0]
+
+		log.Info().Str("namespace", namespace).Str("pod", podName).Str("container", containerName).Int("lines", len(result.Lines)).Str("grep", grep).Send()
+		return strings.Join(result.MatchString, "\n"), nil
+	} else {
+		log.Info().Str("namespace", namespace).Str("pod", podName).Str("container", containerName).Send()
+		return buf.String(), nil
+	}
 }
 
 func (provider *Provider) GetNamespaceEvents(ctx context.Context, namespace string) (string, error) {
@@ -260,12 +227,28 @@ func (provider *Provider) GetKubernetesVersion() (*semver.SemVersion, error) {
 	return &serverVersionSemVer, nil
 }
 
-func (provider *Provider) GetNamespaces() []string {
+func (provider *Provider) GetNamespaces() (namespaces []string) {
 	if len(config.Config.Tap.Namespaces) > 0 {
-		return utils.Unique(config.Config.Tap.Namespaces)
+		namespaces = utils.Unique(config.Config.Tap.Namespaces)
 	} else {
-		return []string{K8sAllNamespaces}
+		namespaceList, err := provider.clientSet.CoreV1().Namespaces().List(context.TODO(), metav1.ListOptions{})
+		if err != nil {
+			log.Error().Err(err).Send()
+			return
+		}
+
+		for _, ns := range namespaceList.Items {
+			namespaces = append(namespaces, ns.Name)
+		}
 	}
+
+	namespaces = utils.Diff(namespaces, config.Config.Tap.ExcludedNamespaces)
+
+	return
+}
+
+func (provider *Provider) GetClientSet() *kubernetes.Clientset {
+	return provider.clientSet
 }
 
 func getClientSet(config *rest.Config) (*kubernetes.Clientset, error) {
